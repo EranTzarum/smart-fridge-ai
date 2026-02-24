@@ -28,7 +28,7 @@ import re
 import json
 import difflib
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -144,6 +144,33 @@ Category equivalence — treat these as valid matches for user requests:
 Only declare an ingredient missing if NO item in the inventory — by name or by
 category — can serve as a culinary equivalent for what the client requested.
 
+━━━ PORTION CONTROL — MANDATORY ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+By default, generate ALL recipes scaled for EXACTLY ONE average adult serving.
+NEVER use the entire available inventory if it exceeds a normal single portion.
+Use realistic culinary portion sizes per person:
+  - Meat / poultry / fish : ~150–200 g  (≈ 0.2 units if listed by kg)
+  - Fresh vegetables       : 1–2 items or ~100–150 g
+  - Dairy (milk, cream)    : ~50–100 ml
+  - Dry pasta / grains     : ~80 g
+  - Eggs                   : 1–2 units
+
+The quantity_used values in used_fridge_items MUST reflect a realistic SINGLE
+portion — never the full available stock. Using 3 kg of chicken for one person
+is forbidden. If the client later requests scaling for more diners, you will
+receive an explicit follow-up message asking you to update the quantities.
+
+━━━ EXCLUSION RULE (excluded_items field) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The excluded_items array MUST be minimal. ONLY populate it in these two cases:
+  1. The user specifically requested an ingredient or dish type that you could
+     not deliver (e.g., user asked for "pasta" but there is none in inventory).
+  2. You made 1–2 significant culinary substitutions that the client should know
+     about (e.g., used turkey instead of beef for a dietary reason).
+
+DO NOT explain why you skipped unrelated items that nobody asked for.
+Example of what is FORBIDDEN: listing "בננה — לא מתאים לתבשיל עוף" when the
+user asked for a chicken stew. That is obvious — omit it entirely.
+If there are no notable exclusions or substitutions, return an empty array: [].
+
 ━━━ ABSOLUTE RULES — NEVER VIOLATE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 1. All text values in the JSON must be in Hebrew.
 2. Never use the words or concepts: expiry, waste, saving ingredients, urgent,
@@ -186,13 +213,22 @@ def _is_food_item(item: dict) -> bool:
     return True
 
 
-def get_urgent_items(days_ahead: int = 14) -> list[dict]:
+def get_all_active_items() -> list[dict]:
     """
-    Fetches active fridge items expiring within `days_ahead` days.
-    Strips non-food items deterministically in Python before anything reaches the LLM.
-    Returns items with `id` and `quantity` for downstream DB updates.
+    Fetches ALL active fridge items regardless of expiry date.
+
+    Previous behaviour (get_urgent_items) applied &expiry_date=lte.{target_date},
+    which silently hid frozen meat, pantry staples, and any item expiring beyond
+    the 14-day window — making the LLM claim those ingredients didn't exist.
+
+    The full active inventory is returned so the LLM has an accurate picture of
+    what is actually in the kitchen. Items are sorted by expiry_date ascending so
+    the most time-sensitive ingredients appear first in the prompt.
+
+    Non-food line items (deposits, bags, 'אחר' category) are stripped in Python
+    before the list reaches the LLM.
     """
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Scanning virtual fridge...")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetching full active inventory...")
 
     supabase_url = os.environ.get("SUPABASE_URL")
     supabase_key = os.environ.get("SUPABASE_KEY")
@@ -200,12 +236,10 @@ def get_urgent_items(days_ahead: int = 14) -> list[dict]:
         print("ERROR: Supabase credentials missing.")
         return []
 
-    target_date = (datetime.now() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
     endpoint = (
         f"{supabase_url}/rest/v1/fridge_items"
         f"?select=id,item_name,category,quantity,expiry_date"
         f"&status=eq.active"
-        f"&expiry_date=lte.{target_date}"
     )
 
     try:
@@ -218,6 +252,7 @@ def get_urgent_items(days_ahead: int = 14) -> list[dict]:
         if filtered_count:
             print(f"INFO: Filtered out {filtered_count} non-food item(s) before recipe generation.")
 
+        # Sort soonest-expiring first so the LLM naturally prioritises them
         food_items.sort(key=lambda x: x["expiry_date"])
         return food_items
 
@@ -438,12 +473,11 @@ def add_to_smart_list(supabase_url: str, supabase_key: str, item_name: str) -> N
     Triggered automatically when a fridge item's quantity reaches zero after cooking.
 
     Target table schema:
-      item_name (text), added_at (timestamptz), status (text, default 'pending')
+      item_name (text), created_at (timestamptz, default NOW()), status (text, default 'pending')
     """
     endpoint = f"{supabase_url}/rest/v1/smart_shopping_list"
     payload  = {
         "item_name": item_name,
-        "added_at":  datetime.now().isoformat(),
         "status":    "pending",
     }
     headers = _build_headers(supabase_key, {
@@ -481,7 +515,9 @@ def consume_recipe_items(
 
     for used in used_items:
         name     = used.get("item_name", "").strip()
-        qty_used = max(1, int(used.get("quantity_used", 1)))
+        # Float arithmetic: quantities can be fractional (e.g., 0.25 kg of meat).
+        # int() was truncating decimals and breaking partial-deduction tracking.
+        qty_used = max(1.0, float(used.get("quantity_used", 1.0)))
 
         db_item = fridge_by_name.get(name)
         if not db_item:
@@ -496,8 +532,9 @@ def consume_recipe_items(
                 continue
 
         item_id       = db_item["id"]
-        current_qty   = int(db_item.get("quantity", 1))
-        remaining_qty = current_qty - qty_used
+        current_qty   = float(db_item.get("quantity", 1.0))
+        # round() prevents floating-point noise (e.g., 2.674 - 1.0 = 1.6739999...)
+        remaining_qty = round(current_qty - qty_used, 3)
 
         try:
             if remaining_qty <= 0:
@@ -593,9 +630,9 @@ def run_chef_agent() -> None:
     supabase_url = os.environ.get("SUPABASE_URL")
     supabase_key = os.environ.get("SUPABASE_KEY")
 
-    urgent_items = get_urgent_items()
-    if not urgent_items:
-        print("\n[שף]: המקרר שלך מצוין — בוא נבשל כשיהיו מרכיבים חדשים.")
+    active_items = get_all_active_items()
+    if not active_items:
+        print("\n[שף]: המקרר ריק — אין פריטים פעילים במלאי.")
         return
 
     print("\n" + "═" * 56)
@@ -603,16 +640,16 @@ def run_chef_agent() -> None:
     print("═" * 56)
 
     today = datetime.now()
-    print(f"\nמה יש לך במטבח עכשיו ({len(urgent_items)} פריטים):\n")
-    for item in urgent_items[:7]:
+    print(f"\nמה יש לך במטבח עכשיו ({len(active_items)} פריטים):\n")
+    for item in active_items[:7]:
         days_left    = (datetime.strptime(item["expiry_date"], "%Y-%m-%d") - today).days
         urgency_flag = "⚠ " if days_left <= 3 else "  "
         print(
             f"  {urgency_flag}{item['item_name']:22s}"
             f"  ({item['quantity']} יח׳  ·  עוד {days_left} ימים)"
         )
-    if len(urgent_items) > 7:
-        print(f"  ... ועוד {len(urgent_items) - 7} פריטים נוספים.")
+    if len(active_items) > 7:
+        print(f"  ... ועוד {len(active_items) - 7} פריטים נוספים.")
 
     print("\nמה אתה רוצה לאכול? (לדוגמה: קינוח שוקולד, פסטה איטלקית, סלט קל, ארוחת בוקר)")
     user_vibe = _read_input(">> ")
@@ -626,7 +663,7 @@ def run_chef_agent() -> None:
     chat = _create_chef_chat()
 
     try:
-        recipe = _send_and_parse(chat, _build_initial_prompt(urgent_items, user_vibe))
+        recipe = _send_and_parse(chat, _build_initial_prompt(active_items, user_vibe))
     except Exception as e:
         print(f"AI ERROR: {e}")
         return
@@ -662,11 +699,46 @@ def run_chef_agent() -> None:
                 print("\n[שף]: לא ניתן לעדכן מלאי — המתכון לא הוחזר בפורמט מסודר.")
                 return
 
-            used_items = recipe.get("used_fridge_items", [])
+            # ── Step 1: Ask number of diners ──────────────────────────────────
+            print("\n[שף]: בחירה מצוינת! לכמה אנשים תרצה שאכין את המנה?")
+            diners_input = _read_input(">> ").strip()
+            if not diners_input:
+                diners_input = "1"
+
+            print(
+                f"\n[{datetime.now().strftime('%H:%M:%S')}] "
+                f"מעדכן כמויות ל-{diners_input} סועדים..."
+            )
+
+            # ── Step 2: Ask the LLM to scale all quantities ───────────────────
+            # The chat session already holds the full recipe history, so we only
+            # need to send the scaling instruction — no need to re-describe the dish.
+            scaling_prompt = (
+                f"הלקוח אישר את המתכון. אנא עדכן את כל הכמויות במתכון עבור "
+                f"{diners_input} סועדים. "
+                "ודא שסך הכמויות לא חורג מהמלאי הזמין. "
+                "החזר את ה-JSON המלא והמעודכן."
+            )
+            try:
+                scaled_recipe = _send_and_parse(chat, scaling_prompt)
+            except Exception as e:
+                print(f"AI ERROR בעדכון כמויות: {e}. משתמש בכמויות המקוריות.")
+                scaled_recipe = recipe
+
+            # ── Step 3: Display the scaled recipe ─────────────────────────────
+            print("\n" + "═" * 56)
+            print(_format_recipe_for_display(scaled_recipe))
+            print("═" * 56)
+
+            # ── Step 4: Deduct the scaled quantities from the DB ──────────────
+            # If scaling produced a valid structured recipe use it; otherwise fall
+            # back to the original recipe's quantities to avoid a silent no-op.
+            source_recipe = scaled_recipe if not scaled_recipe.get("_raw_fallback") else recipe
+            used_items    = source_recipe.get("used_fridge_items", [])
             if not used_items:
                 print("\n[שף]: לא זוהו מרכיבים ספציפיים מהמקרר — מלאי לא עודכן.")
             else:
-                consume_recipe_items(supabase_url, supabase_key, used_items, urgent_items)
+                consume_recipe_items(supabase_url, supabase_key, used_items, active_items)
 
             print("\n[שף]: בתיאבון! תהנה מהארוחה.")
             return

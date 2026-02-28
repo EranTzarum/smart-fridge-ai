@@ -2,6 +2,8 @@
 
 An AI-native smart fridge proof-of-concept that combines a receipt-scanning ingestion engine with a conversational personal chef — powered by **Google Gemini 2.5 Flash** and **Supabase** (PostgreSQL REST API).
 
+The core chef logic (`chef_agent.py`) is now exposed over HTTP via a **FastAPI server** (`api_server.py`), serving as the backend for the Smart Fridge Flutter app. The CLI agents remain fully functional as standalone tools.
+
 The system is built around a strict, enforced boundary: the LLM handles perception and creativity; Python handles every deterministic decision.
 
 ---
@@ -20,21 +22,29 @@ The system is built around a strict, enforced boundary: the LLM handles percepti
    - [Intent Classification Engine](#intent-classification-engine)
    - [Diner Scaling Flow](#diner-scaling-flow)
    - [Smart Shopping List Flow](#smart-shopping-list-flow)
-5. [End-to-End Data Flow](#end-to-end-data-flow)
-6. [Prerequisites & Setup](#prerequisites--setup)
-7. [Running the CLI Agents](#running-the-cli-agents)
-8. [Database Schema](#database-schema)
+5. [api_server.py — REST API Server](#api_serverpy--rest-api-server)
+   - [Architecture](#api-architecture)
+   - [Session Store](#session-store)
+   - [Endpoints](#endpoints)
+   - [Request & Response Schemas](#request--response-schemas)
+   - [Session Lifecycle](#session-lifecycle)
+   - [Production Notes](#production-notes)
+6. [End-to-End Data Flow](#end-to-end-data-flow)
+7. [Prerequisites & Setup](#prerequisites--setup)
+8. [Running the System](#running-the-system)
+9. [Database Schema](#database-schema)
 
 ---
 
 ## System Overview
 
-| Agent | Script | Entry Point | Purpose |
+| Component | Script | Entry Point | Purpose |
 |---|---|---|---|
 | **Scanner** | `scanner.py` | `run_scanner(image_path)` | Parses a grocery receipt image and upserts items into the virtual fridge inventory |
-| **Chef** | `chef_agent.py` | `run_chef_agent()` | Reads the full active inventory and conducts a stateful Hebrew conversation to suggest, refine, scale, and log cooked recipes |
+| **Chef (CLI)** | `chef_agent.py` | `run_chef_agent()` | Reads the full active inventory and conducts a stateful Hebrew conversation to suggest, refine, scale, and log cooked recipes |
+| **API Server** | `api_server.py` | `uvicorn api_server:app` | Wraps the chef engine over HTTP for the Smart Fridge Flutter app; manages per-user LLM chat sessions |
 
-Both scripts are **Cloud Function–ready**: their entry points accept no runtime dependencies beyond environment variables and can be invoked from any orchestrator.
+The scanner and chef CLI are **Cloud Function–ready**: their entry points accept no runtime dependencies beyond environment variables. The API server is the production-facing layer for the mobile client.
 
 ---
 
@@ -375,6 +385,244 @@ The 70 % fuzzy threshold inside `consume_recipe_items` handles minor name drift 
 
 ---
 
+## api_server.py — REST API Server
+
+### API Architecture
+
+`api_server.py` wraps the chef engine over HTTP without modifying `chef_agent.py`. All reusable functions are imported directly; the interactive loop in `run_chef_agent()` is never triggered because it is guarded by `if __name__ == "__main__":`.
+
+```
+Flutter App
+     │  HTTP JSON
+     ▼
+┌──────────────────────────────────────────────────────────────┐
+│  FastAPI  (api_server.py)                                    │
+│                                                              │
+│  Routing · Pydantic validation · CORS · Structured logging   │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  In-memory session store  (_sessions dict)             │  │
+│  │  user_id → { chat, active_items, recipe, created_at }  │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                                                              │
+│  Imports from chef_agent.py (unmodified):                    │
+│    _create_chef_chat        _build_initial_prompt            │
+│    _send_and_parse          _build_revision_prompt           │
+│    get_all_active_items     _patch_fridge_item               │
+│    add_to_smart_list                                         │
+└──────────────────────┬───────────────────────────────────────┘
+                       │
+          ┌────────────┴────────────┐
+          ▼                         ▼
+   Gemini 2.5 Flash           Supabase REST API
+   (stateful chat)            (fridge_items, smart_shopping_list)
+```
+
+### Session Store
+
+The session store is a plain Python `dict` that maps a `user_id` string to a session object. It is created in-process at server startup and holds one session per active user conversation.
+
+```python
+_sessions: dict[str, dict] = {}
+
+# Session object structure:
+{
+    "chat":         <google.genai Chat>,  # retains full conversation history
+    "active_items": list[dict],           # fridge snapshot at generation time
+    "recipe":       dict,                 # most recent generated/revised recipe
+    "created_at":   datetime,
+}
+```
+
+The Gemini `chat` object is stored per-session so subsequent `/revise_recipe` calls can send only the user's feedback — the full fridge inventory is never re-transmitted after the first turn. This mirrors exactly the stateful chat pattern used by the CLI agent.
+
+### Endpoints
+
+#### `GET /health`
+
+Liveness check. Returns server status and the current server timestamp.
+
+**Response `200`**
+```json
+{ "status": "ok", "timestamp": "2026-02-22T14:23:01.123456" }
+```
+
+---
+
+#### `GET /fridge_items`
+
+Returns the full active inventory sorted by soonest expiry date. Non-food items (deposits, bags, `אחר` category) are filtered out before the response is returned. Use this endpoint to populate the fridge overview screen.
+
+**Response `200`** — `list[dict]` (see `fridge_items` schema)
+
+---
+
+#### `POST /generate_recipe`
+
+Generates a new recipe from scratch for the given user vibe and guest count. Opens a fresh Gemini chat session and stores it in `_sessions`.
+
+**Request body**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `user_id` | `string` | Yes | Unique user identifier (UUID) |
+| `prompt` | `string` | Yes | Culinary vibe, e.g. `"ארוחת בוקר קלילה"` |
+| `guests` | `integer` | No (default: `1`) | Number of diners to scale for (1–20) |
+
+**Internal flow**
+
+```
+1. get_all_active_items()             → active_items[]  (non-food filtered, sorted)
+2. _create_chef_chat()                → new stateful Gemini session
+3. _send_and_parse(initial_prompt)    → base recipe for 1 person
+4. if guests > 1:
+       _send_and_parse(scaling_prompt) → scaled recipe (non-fatal on failure)
+5. _sessions[user_id] = { chat, active_items, recipe, created_at }
+6. Return recipe + active_items + guests
+```
+
+Calling this endpoint again for the same `user_id` replaces the existing session.
+
+**Response `200`** — `GenerateRecipeResponse`
+
+**Error `409`** — fridge is empty (no active items)
+
+**Error `502`** — Gemini returned an unparseable response
+
+---
+
+#### `POST /revise_recipe`
+
+Sends freeform feedback to the existing chat session and returns a revised recipe. Because the session retains full conversation history, the inventory is never re-sent.
+
+**Request body**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `user_id` | `string` | Yes | Must match an active session |
+| `feedback` | `string` | Yes | Freeform change request, e.g. `"תעשה את זה טבעוני"` |
+
+**Internal flow**
+
+```
+1. _require_session(user_id)               → 404 if no session
+2. _send_and_parse(revision_prompt)        → revised recipe
+3. session["recipe"] = revised             → update stored recipe for /confirm_recipe
+4. Return revised recipe + active_items
+```
+
+**Response `200`** — `GenerateRecipeResponse`
+
+**Error `404`** — no active session for this `user_id`; call `/generate_recipe` first
+
+**Error `502`** — Gemini returned an unparseable response
+
+---
+
+#### `POST /confirm_recipe`
+
+Executes the inventory deduction for the confirmed recipe and destroys the session. Returns a structured audit trail of every quantity change.
+
+**Request body**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `user_id` | `string` | Yes | Must match an active session |
+
+**Internal flow**
+
+```
+1. _require_session(user_id) → session (recipe + active_items)
+2. For each item in recipe.used_fridge_items:
+       a. _resolve_fridge_item()           → exact match, then 70% fuzzy fallback
+       b. remaining = round(qty - used, 3) → float arithmetic, rounded to 3 d.p.
+       c. remaining ≤ 0:
+              _patch_fridge_item(status='consumed', quantity=0)
+              add_to_smart_list(item_name)
+       d. remaining > 0:
+              _patch_fridge_item(quantity=remaining)
+3. _sessions.pop(user_id)                 → session destroyed
+4. Return deducted_items[] + shopping_list_additions[]
+```
+
+DB errors on individual items are logged and skipped — other items in the recipe are still processed.
+
+**Response `200`** — `ConfirmRecipeResponse`
+
+**Error `404`** — no active session
+
+**Error `422`** — recipe contains no items to deduct
+
+**Error `500`** — Supabase credentials missing
+
+---
+
+### Request & Response Schemas
+
+```
+GenerateRecipeRequest          GenerateRecipeResponse
+─────────────────────          ──────────────────────
+user_id:  string               recipe:       dict
+prompt:   string               active_items: list[dict]
+guests:   int (default 1)      guests:       int
+
+
+ReviseRecipeRequest            (response: GenerateRecipeResponse)
+───────────────────
+user_id:  string
+feedback: string
+
+
+ConfirmRecipeRequest           ConfirmRecipeResponse
+────────────────────           ─────────────────────
+user_id:  string               status:                  string
+                               deducted_items:          list[DeductedItem]
+                               shopping_list_additions: list[string]
+
+DeductedItem
+────────────
+item_name:          string
+quantity_before:    float
+quantity_deducted:  float
+quantity_after:     float
+fully_consumed:     bool
+```
+
+### Session Lifecycle
+
+```
+POST /generate_recipe
+        │
+        └─ _sessions[user_id] = { chat, active_items, recipe, created_at }
+                │
+                │   (zero or more times)
+                ▼
+        POST /revise_recipe
+                │
+                └─ session["recipe"] updated in place
+                        │
+                        ▼
+                POST /confirm_recipe
+                        │
+                        ├─ Deduct quantities from Supabase
+                        ├─ Add depleted items to smart_shopping_list
+                        └─ _sessions.pop(user_id)  ← session destroyed
+```
+
+A session is never explicitly expired — calling `/generate_recipe` again for the same `user_id` silently replaces it. In production, add a TTL eviction policy via Redis.
+
+### Production Notes
+
+| Concern | Current (PoC) | Recommended for Production |
+|---|---|---|
+| **Session storage** | In-process `dict` | Redis with TTL eviction; serialise the `chat` object or reconstruct it from stored history |
+| **CORS** | `allow_origins=["*"]` | Restrict to the Flutter app's actual origin |
+| **Authentication** | None | JWT or API key middleware on all endpoints |
+| **Supabase I/O** | Synchronous `requests` | Wrap with `asyncio.to_thread()` for non-blocking async I/O |
+| **Scalability** | Single process | Multi-process / multi-pod deployment requires shared session store (Redis) |
+
+---
+
 ## End-to-End Data Flow
 
 ```
@@ -389,21 +637,28 @@ Receipt image (JPG)
                 ▼
       fridge_items (status='active')
                 │
-                ▼  chef_agent.py
-      ├─ Fetch ALL active items → filter non-food → sort by expiry
-      ├─ User vibe input
-      ├─ Gemini Chat (stateful) → recipe JSON
-      ├─ Display → user feedback → classify intent
-      │
-      ├─ revise → scaling prompt in same chat session → loop
-      │
-      └─ confirm
-              ├─ Ask diners → LLM scaling turn → display scaled recipe
-              ├─ consume_recipe_items() → PATCH quantities
-              └─ add_to_smart_list() for depleted items
-                        │
-                        ▼
-              smart_shopping_list (status='pending')
+         ┌──────┴──────────────────────────────────────────┐
+         │  CLI path (chef_agent.py)                        │  API path (api_server.py)
+         │                                                  │
+         ▼                                                  ▼
+      Fetch ALL active items                      POST /generate_recipe
+      Filter non-food → sort by expiry            → fetch inventory
+      User vibe input                             → open Gemini session
+      Gemini Chat (stateful) → recipe JSON        → generate + scale recipe
+      Display → classify intent                   → store session in _sessions
+         │                                                  │
+         ├─ revise → revision loop                POST /revise_recipe
+         │           (max 5 rounds)               → send feedback to stored chat
+         │                                        → update session["recipe"]
+         └─ confirm                                         │
+              ├─ Ask diners                        POST /confirm_recipe
+              ├─ LLM scaling turn                  → deduct float quantities
+              ├─ consume_recipe_items()             → _patch_fridge_item()
+              └─ add_to_smart_list()               → add_to_smart_list()
+                        │                          → destroy session
+                        └──────────┬───────────────┘
+                                   ▼
+                         smart_shopping_list (status='pending')
 ```
 
 ---
@@ -413,7 +668,11 @@ Receipt image (JPG)
 **Requirements:** Python 3.11+, a [Google AI Studio](https://aistudio.google.com/) API key, a [Supabase](https://supabase.com/) project.
 
 ```bash
+# Core dependencies (scanner + chef CLI)
 pip install google-genai pillow python-dotenv requests
+
+# API server (additional)
+pip install fastapi uvicorn
 ```
 
 Create a `.env` file in the project root (already listed in `.gitignore`):
@@ -426,7 +685,29 @@ SUPABASE_KEY=your_supabase_anon_or_service_role_key
 
 ---
 
-## Running the CLI Agents
+## Running the System
+
+### API Server
+
+Start the FastAPI server with auto-reload enabled for development:
+
+```bash
+python -m uvicorn api_server:app --reload --port 8000
+```
+
+The interactive API docs (Swagger UI) are available at `http://localhost:8000/docs` once the server is running.
+
+**Sample startup output:**
+
+```
+INFO:     Will watch for changes in these directories: ['/path/to/smart-fridge-poc']
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:     Started reloader process [12345] using WatchFiles
+INFO:     Started server process [12346]
+INFO:     Application startup complete.
+```
+
+---
 
 ### Receipt Scanner
 

@@ -616,7 +616,7 @@ A session is never explicitly expired — calling `/generate_recipe` again for t
 | Concern | Current (PoC) | Recommended for Production |
 |---|---|---|
 | **Session storage** | In-process `dict` | Redis with TTL eviction; serialise the `chat` object or reconstruct it from stored history |
-| **CORS** | `allow_origins=["*"]` | Restrict to the Flutter app's actual origin |
+| **CORS** | `allow_origins=["*"]`, `allow_credentials=False` — wildcard origins with credentials disabled to avoid preflight conflicts during Flutter Web local development | Restrict `allow_origins` to the Flutter app's actual origin before launch |
 | **Authentication** | None | JWT or API key middleware on all endpoints |
 | **Supabase I/O** | Synchronous `requests` | Wrap with `asyncio.to_thread()` for non-blocking async I/O |
 | **Scalability** | Single process | Multi-process / multi-pod deployment requires shared session store (Redis) |

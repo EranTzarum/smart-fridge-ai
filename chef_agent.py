@@ -171,6 +171,20 @@ Example of what is FORBIDDEN: listing "בננה — לא מתאים לתבשיל
 user asked for a chicken stew. That is obvious — omit it entirely.
 If there are no notable exclusions or substitutions, return an empty array: [].
 
+━━━ INVENTORY LOCK — CRITICAL DIRECTIVE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+You are STRICTLY FORBIDDEN from using or suggesting any ingredient that is not
+explicitly listed in the active inventory provided to you in this conversation.
+
+  • If a requested dish requires an unavailable ingredient:
+      1. Adapt the recipe to use ONLY items that ARE present in the inventory.
+      2. If no reasonable adaptation exists, refuse that specific dish and propose
+         a different recipe that can be fully prepared with the available items.
+  • Basic, universally-owned pantry staples (salt, water, black pepper, olive oil,
+    sugar) MAY appear in pantry_staples_needed — but every non-trivial ingredient
+    (proteins, vegetables, dairy, carbs, sauces) MUST be present in the provided
+    inventory list. Never assume a non-trivial ingredient is "probably available".
+  • Use chef_message to explain any adaptation, substitution, or refusal.
+
 ━━━ ABSOLUTE RULES — NEVER VIOLATE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 1. All text values in the JSON must be in Hebrew.
 2. Never use the words or concepts: expiry, waste, saving ingredients, urgent,
@@ -467,26 +481,60 @@ def _patch_fridge_item(supabase_url: str, supabase_key: str, item_id: str, patch
     response.raise_for_status()
 
 
-def add_to_smart_list(supabase_url: str, supabase_key: str, item_name: str) -> None:
+def add_to_smart_list(
+    supabase_url: str,
+    supabase_key: str,
+    item_name: str,
+    *,
+    quantity: float = 1.0,
+    category: str = "כללי",
+    user_id: str | None = None,
+) -> None:
     """
     Adds a depleted item to the smart_shopping_list table.
     Triggered automatically when a fridge item's quantity reaches zero after cooking.
 
     Target table schema:
-      item_name (text), created_at (timestamptz, default NOW()), status (text, default 'pending')
+      item_name (text), quantity (numeric), category (text, default 'כללי'),
+      user_id (text, nullable), created_at (timestamptz, default NOW()),
+      status (text, default 'pending')
+
+    Args:
+        quantity: Baseline restock quantity for the predictive model (default 1.0).
+        category: Category carried over from the source fridge item (default "כללי").
+        user_id:  Owner of the shopping list entry; omitted from payload if None.
+
+    Raises:
+        requests.HTTPError: On any non-2xx Supabase response. The exact response
+            body is logged before the exception is re-raised so callers can see
+            the precise Supabase error message (e.g. column not found, RLS denial).
     """
     endpoint = f"{supabase_url}/rest/v1/smart_shopping_list"
-    payload  = {
+    payload: dict = {
         "item_name": item_name,
+        "quantity":  quantity,
+        "category":  category,
         "status":    "pending",
     }
+    if user_id is not None:
+        payload["user_id"] = user_id
+
     headers = _build_headers(supabase_key, {
         "Content-Type": "application/json",
         "Prefer":       "return=minimal",
     })
+
     response = requests.post(endpoint, json=payload, headers=headers)
-    response.raise_for_status()
-    print(f"  SHOPPING LIST  →  '{item_name}' נוסף לרשימת הקניות החכמה.")
+
+    if not response.ok:
+        # Log the full Supabase error body so the root cause is always visible.
+        print(
+            f"  SHOPPING LIST ERROR  →  '{item_name}' "
+            f"[HTTP {response.status_code}]: {response.text}"
+        )
+        response.raise_for_status()
+
+    print(f"  SHOPPING LIST  →  '{item_name}' נוסף לרשימת הקניות החכמה (כמות: {quantity}).")
 
 
 def consume_recipe_items(
@@ -543,7 +591,10 @@ def consume_recipe_items(
                     "quantity": 0,
                 })
                 print(f"  ✓  '{db_item['item_name']}' — נוצל במלואו.")
-                add_to_smart_list(supabase_url, supabase_key, db_item["item_name"])
+                add_to_smart_list(
+                    supabase_url, supabase_key, db_item["item_name"],
+                    category=db_item.get("category", "כללי"),
+                )
             else:
                 _patch_fridge_item(supabase_url, supabase_key, item_id, {
                     "quantity": remaining_qty,

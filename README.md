@@ -18,6 +18,7 @@ The system is built around a strict, enforced boundary: the LLM handles percepti
    - [Smart Upsert Workflow](#smart-upsert-workflow)
 4. [chef_agent.py — Personal Chef Engine](#chef_agentpy--personal-chef-engine)
    - [Layer Map](#chef-layer-map)
+   - [Logic hardening & DB behaviour](#logic-hardening--db-behaviour)
    - [Stateful Chat Architecture](#stateful-chat-architecture)
    - [Intent Classification Engine](#intent-classification-engine)
    - [Diner Scaling Flow](#diner-scaling-flow)
@@ -267,6 +268,11 @@ Supabase fridge_items (all active)
 > **Why fetch all active items, not just those expiring soon?**
 > An earlier version of the agent queried only items expiring within 14 days. This silently hid frozen meat, pantry staples, and any item with a longer shelf life — causing the LLM to wrongly report those ingredients as missing. `get_all_active_items()` retrieves the full inventory so the LLM has an accurate picture of what is actually in the kitchen. Items are sorted soonest-expiring first so time-sensitive ingredients appear at the top of the prompt.
 
+### Logic hardening & DB behaviour
+
+- **LLM inventory lock:** A strict system-directive forbids the AI from using or suggesting any ingredient not in the active inventory. Dishes must be adapted to available items or refused; only basic pantry staples may appear without being listed. This eliminates hallucinated ingredients and keeps recipes grounded in the current fridge state.
+- **Smart shopping list:** Inserts now include a `quantity` column (default 1.0) and carry over the source fridge item's `category`, so list entries support restock sizing and retain the same taxonomy. Deduction (PATCH fridge) and shopping-list insert (POST) are executed as separate steps so a failed insert does not mask a successful deduction; failures are logged and the client can surface them explicitly.
+
 ### Stateful Chat Architecture
 
 A single `google.genai` chat session is created **once** per run via `_create_chef_chat()`. `SYSTEM_INSTRUCTION` — the chef persona contract — is loaded at session creation and persists for the entire conversation. Every `send_message()` call appends to the retained history automatically.
@@ -303,6 +309,7 @@ The system instruction enforces the following rules at the model level across al
 | **Language** | All text values in Hebrew |
 | **Portion control** | Default to exactly one adult serving; never use full available stock |
 | **Semantic matching** | Evaluate `category` field, not just `item_name`, before declaring an ingredient missing |
+| **Inventory lock** | Strict directive: the AI must not use or suggest any ingredient not explicitly in the active inventory. Requested dishes must be adapted to available items or refused in favour of a recipe that can be fully prepared; only basic pantry staples (salt, oil, pepper, etc.) may appear without being in the list. `chef_message` must explain any adaptation or refusal. |
 | **Hallucination ban** | Never invent an ingredient not in the provided inventory; use `chef_message` to communicate any gap |
 | **Exclusion minimalism** | `excluded_items` only for ingredients the user explicitly requested but couldn't get, or 1–2 notable substitutions — not every unused item |
 | **Forbidden language** | Never say: expiry, waste, saving, urgent, תפוגה, בזבוז, לחסוך, דחוף |
@@ -361,7 +368,12 @@ User: "כן"
 
 ### Smart Shopping List Flow
 
-`add_to_smart_list()` is called automatically inside `consume_recipe_items()` whenever an item's quantity reaches zero after cooking. It requires no user action.
+`add_to_smart_list()` is called automatically when an item's quantity reaches zero after cooking. It requires no user action.
+
+**Behaviour**
+
+- **Quantity column:** Each insert includes a `quantity` field (default `1.0`) so the shopping list supports baseline restock amounts for downstream predictive or UI logic.
+- **Category carry-over:** Fully consumed fridge items are added with their original `category` from the source row (e.g. `פירות וירקות`), so list entries retain the same taxonomy as the fridge inventory.
 
 ```
 consume_recipe_items()
@@ -377,11 +389,13 @@ consume_recipe_items()
         │
         └─ remaining ≤ 0
                 ├→ PATCH fridge_items SET status='consumed', quantity=0
-                └→ POST smart_shopping_list {item_name, status='pending'}
-                         (created_at set automatically by Supabase default)
+                └→ POST smart_shopping_list { item_name, quantity, category, status }
+                         (category = source fridge item; created_at from Supabase default)
 ```
 
-The 70 % fuzzy threshold inside `consume_recipe_items` handles minor name drift that can occur when the LLM returns `"עגבניה"` in `used_fridge_items` but the DB row is stored as `"עגבניות"`.
+**DB transaction decoupling:** Deduction (PATCH fridge) and shopping-list insert (POST) are executed as separate steps. A failed shopping-list insert is logged and does not mask a successful deduction, so inventory state remains consistent and clients can surface the failure explicitly.
+
+The 70 % fuzzy threshold inside `consume_recipe_items` handles minor name drift when the LLM returns e.g. `"עגבניה"` in `used_fridge_items` but the DB row is stored as `"עגבניות"`.
 
 ---
 
@@ -536,16 +550,17 @@ Executes the inventory deduction for the confirmed recipe and destroys the sessi
 2. For each item in recipe.used_fridge_items:
        a. _resolve_fridge_item()           → exact match, then 70% fuzzy fallback
        b. remaining = round(qty - used, 3) → float arithmetic, rounded to 3 d.p.
-       c. remaining ≤ 0:
-              _patch_fridge_item(status='consumed', quantity=0)
-              add_to_smart_list(item_name)
-       d. remaining > 0:
-              _patch_fridge_item(quantity=remaining)
+       c. PATCH fridge (deduction) first  → on failure: log, skip item
+       d. Append to deducted_items        → only after successful PATCH
+       e. If remaining ≤ 0:
+              add_to_smart_list(item_name, quantity=1.0, category=source category)
+              in a separate try; on failure log only — deduction already committed
+       f. If remaining > 0: PATCH quantity only
 3. _sessions.pop(user_id)                 → session destroyed
 4. Return deducted_items[] + shopping_list_additions[]
 ```
 
-DB errors on individual items are logged and skipped — other items in the recipe are still processed.
+**DB transaction decoupling:** Deduction and shopping-list insert are separate operations. A failed shopping-list insert does not hide a successful deduction; the response omits that item from `shopping_list_additions` so the client can surface the failure. Per-item PATCH failures skip that item only; the rest of the recipe is still processed.
 
 **Response `200`** — `ConfirmRecipeResponse`
 
@@ -812,6 +827,8 @@ python chef_agent.py
 | Column | Type | Set by | Description |
 |---|---|---|---|
 | `item_name` | `text` | Python | Name of the depleted item |
+| `quantity` | `numeric` | Python | Baseline restock quantity (default 1.0); supports predictive/UI use |
+| `category` | `text` | Python | Carried over from the source fridge item (e.g. `פירות וירקות`) |
 | `created_at` | `timestamptz` | Supabase default | Timestamp of depletion event |
 | `status` | `text` | Python | `pending` (default) |
 

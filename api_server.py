@@ -374,40 +374,56 @@ def confirm_recipe(body: ConfirmRecipeRequest) -> ConfirmRecipeResponse:
         current_qty   = float(db_item.get("quantity", 1.0))
         remaining_qty = round(current_qty - qty_used, 3)
 
+        # ── Fridge deduction (always attempt; fatal per-item on failure) ─────────
         try:
             if remaining_qty <= 0:
                 _patch_fridge_item(supabase_url, supabase_key, item_id, {
                     "status":   "consumed",
                     "quantity": 0,
                 })
-                add_to_smart_list(supabase_url, supabase_key, db_item["item_name"])
-                shopping.append(db_item["item_name"])
-                deducted.append(DeductedItem(
-                    item_name=db_item["item_name"],
-                    quantity_before=current_qty,
-                    quantity_deducted=qty_used,
-                    quantity_after=0.0,
-                    fully_consumed=True,
-                ))
             else:
                 _patch_fridge_item(supabase_url, supabase_key, item_id, {
                     "quantity": remaining_qty,
                 })
-                deducted.append(DeductedItem(
-                    item_name=db_item["item_name"],
-                    quantity_before=current_qty,
-                    quantity_deducted=qty_used,
-                    quantity_after=remaining_qty,
-                    fully_consumed=False,
-                ))
-
-            log.info(
-                "Deducted '%s': %.3f → %.3f",
-                db_item["item_name"], current_qty, max(0.0, remaining_qty),
+        except Exception as patch_err:
+            log.error(
+                "DB patch failed for '%s' [id=%s]: %s",
+                db_item["item_name"], item_id, patch_err,
             )
-        except Exception as e:
-            # Non-fatal: log and continue so other items are still processed
-            log.error("DB error updating '%s': %s", db_item["item_name"], e)
+            continue  # Skip recording and shopping — this item was not updated
+
+        # Record the successful deduction regardless of what happens next
+        deducted.append(DeductedItem(
+            item_name=db_item["item_name"],
+            quantity_before=current_qty,
+            quantity_deducted=qty_used,
+            quantity_after=max(0.0, remaining_qty),
+            fully_consumed=(remaining_qty <= 0),
+        ))
+        log.info(
+            "Deducted '%s': %.3f → %.3f",
+            db_item["item_name"], current_qty, max(0.0, remaining_qty),
+        )
+
+        # ── Shopping list insert (isolated — failure must not hide the deduction) ─
+        if remaining_qty <= 0:
+            try:
+                add_to_smart_list(
+                    supabase_url, supabase_key,
+                    db_item["item_name"],
+                    quantity=1.0,
+                    category=db_item.get("category", "כללי"),
+                    user_id=body.user_id,
+                )
+                shopping.append(db_item["item_name"])
+            except Exception as shop_err:
+                # Log the exact error but do NOT append to shopping — the Flutter
+                # app will see the item is absent from shopping_list_additions and
+                # can surface the failure rather than reporting a false success.
+                log.error(
+                    "Shopping list insert failed for '%s' (user=%s): %s",
+                    db_item["item_name"], body.user_id, shop_err,
+                )
 
     # Destroy the session — the conversation is complete
     _sessions.pop(body.user_id, None)
